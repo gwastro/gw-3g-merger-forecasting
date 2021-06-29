@@ -1,0 +1,219 @@
+#!/usr/bin/env python
+import h5py
+import numpy
+import sys, os, logging, argparse
+import Pegasus.DAX3 as dax
+import pycbc.workflow as wf
+import pycbc
+import pycbc.workflow.pegasus_workflow as wdax
+from pycbc.workflow import WorkflowConfigParser
+from pycbc.conversions import mchirp_from_mass1_mass2
+from pycbc.waveform.spa_tmplt import spa_length_in_time
+from scipy.optimize import minimize_scalar
+from multiprocessing import Pool
+import configparser
+
+def to_file(path, ifo=None):
+    """ Takes a str and returns a pycbc.workflow.pegasus_workflow.File
+    instance.
+    """
+    fil = wdax.File(os.path.basename(path))
+    fil.ifo = ifo
+    path = os.path.abspath(path)
+    fil.PFN(path, "local")
+    return fil
+
+# command line parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--injection-file")
+parser.add_argument("--instruments", nargs='*')
+parser.add_argument("--inference-config")
+parser.add_argument("--time", type=float)
+parser.add_argument("--output-dir", default=None,
+                    help="Path to output directory.")
+
+pycbc.init_logging(True)
+
+# add option groups
+wf.add_workflow_command_line_group(parser)
+
+# parser command line
+opts = parser.parse_args()
+
+def get_flow(time, m1, m2):
+    def dt(flow):
+        t = spa_length_in_time(mass1=m1,
+                   mass2=m2,
+                   f_lower=flow,
+                   phase_order=-1)
+        return abs(t - time)
+    res = minimize_scalar(dt, [1, 60])
+    return  res['x']
+
+
+f = h5py.File(opts.injection_file, 'r')
+injpath = os.path.abspath(opts.injection_file)
+tc = f['tc'][:]
+m1s = f['mass1'][:]
+m2s = f['mass2'][:]
+z = f['redshift'][:]
+cv = f['comoving_volume'][:]
+inc = f['inclination'][:]
+pol = f['polarization'][:]
+ra = f['ra'][:]
+dec = f['dec'][:]
+dist = f['distance'][:]
+
+mchirps = mchirp_from_mass1_mass2(m1s, m2s)
+
+import pycbc.psd
+cp = configparser.ConfigParser()
+cp.read(opts.inference_config)
+
+flow = cp.get('model', 'low-frequency-cutoff').split(' ')
+flow = {f.split(':')[0]: float(f.split(':')[1]) for f in flow}
+df = 1.0 / 8192
+fmax = 256
+flen = int(fmax / df)
+
+psds = {}
+
+mopt = cp.get('data', 'fake-strain').split(' ')
+mopt = {f.split(':')[0]: f.split(':')[1] for f in mopt}
+for ifo in mopt:
+    print(ifo, mopt[ifo])
+    psds[ifo] = pycbc.psd.from_string(mopt[ifo], flen, df, flow[ifo])
+
+mopt = cp.get('data', 'fake-strain-from-file').split(' ')
+mopt = {f.split(':')[0]: f.split(':')[1] for f in mopt}
+for ifo in mopt:
+    print(ifo, mopt[ifo])
+    psds[ifo] = pycbc.psd.from_txt(mopt[ifo], flen, df, flow[ifo], is_asd_file=True)
+
+# create workflow and sub-workflows
+workflow = wf.Workflow(opts, "gw")
+
+# make data output and results directories
+wf.makedir(opts.output_dir)
+
+# construct Executable for running sampler
+inference_exe = wf.Executable(workflow.cp, "inference", ifos=workflow.ifos,
+                              out_dir=opts.output_dir)
+
+plot_exe = wf.Executable(workflow.cp, "plot", ifos=workflow.ifos,
+                              out_dir=opts.output_dir)
+
+infhand = to_file(opts.inference_config)
+from copy import copy
+
+# loop over number of loudest events to be analyzed
+def precalc(num_event):
+    time = tc[num_event]
+    m1 = m1s[num_event]
+    m2 = m2s[num_event]
+    mchirp = mchirps[num_event]
+    cov = cv[num_event]
+    fh = get_flow(opts.time, m1, m2)
+
+    # deactivate ifo if only 0.2 Hz above the flow of the instruments
+    ifos = []
+    for ifo in opts.instruments:
+        if flow[ifo] < fh - 0.2:
+            ifos.append(ifo)
+    instr = ' '.join(ifos)
+
+    from pycbc.detector import Detector
+    from pycbc.waveform import get_fd_waveform
+    from pycbc.filter import sigma
+    hp, hc = get_fd_waveform(approximant="TaylorF2", f_final=fh,
+                             mass1=m1, mass2=m2, inclination=inc[num_event],
+                             f_lower=1.0, delta_f=df, distance=dist[num_event])
+    nsnr = 0
+    for ifo in ifos:
+        kmin = int(flow[ifo] / hp.delta_f)
+        kmax = int(fh / hp.delta_f)
+        fvec = hp.sample_frequencies[kmin:kmax]
+        timev = time - spa_length_in_time(mass1=m1, mass2=m2, phase_order=-1, f_lower=fvec)
+        timev = timev.numpy()
+
+        p = psds[ifo]
+        d = Detector(ifo)
+        fp, fc = d.antenna_pattern(ra[num_event], dec[num_event], pol[num_event], timev)
+
+        ht = hp.copy()
+        ht[kmin:kmax] = fp * hp[kmin:kmax] + fc * hc[kmin:kmax]
+        ht[kmax] = 0
+        s = sigma(ht, psd=psds[ifo], low_frequency_cutoff=flow[ifo], high_frequency_cutoff=fh)
+        nsnr += s ** 2.0
+    nsnr = nsnr ** 0.5
+
+    print(num_event, nsnr, ifos)
+    return nsnr, fh, ifos
+
+#data = list(map(precalc, range(len(tc))))
+pool = Pool(30)
+data = pool.map(precalc, range(len(tc)))
+
+nsnrs = numpy.array([t[0] for t in data])
+fhs = numpy.array([t[1] for t in data])
+ifoss = numpy.array([t[2] for t in data])
+
+for num_event in range(len(tc)):
+    time = tc[num_event]
+    m1 = m1s[num_event]
+    m2 = m2s[num_event]
+    mchirp = mchirps[num_event]
+    cov = cv[num_event]
+    fh = fhs[num_event]
+    ifos = ifoss[num_event]
+    instr = ' '.join(ifos)
+
+    if nsnrs[num_event] < 7:
+        print(num_event, nsnrs[num_event], ifos, "SKIPPED")
+        continue
+    else:
+        print(num_event, nsnrs[num_event], ifos)
+
+    # make individual trig ini files
+    path = opts.output_dir + '/inj_%s.ini' % num_event
+    f = open(path, 'w')
+    f.write("""
+[data]
+trigger-time = %s
+injection-file = %s
+
+[global]
+instruments = %s
+mass1_ref = %s
+mass2_ref = %s
+minchirp = %s
+maxchirp = %s
+mincov = %s
+maxcov = %s
+fhigh = %s
+""" % (time, injpath, instr, m1, m2, mchirp - .0001, mchirp + .0001, cov / 10.0, cov * 10.0, fh))
+    f.close()
+
+    fhand = to_file(path)
+
+    # make node for running sampler
+    node = inference_exe.create_node()
+    node.add_input_list_opt("--config-file", [infhand, fhand])
+    inference_file = node.new_output_file_opt(workflow.analysis_time, ".hdf",
+                                              "--output-file",
+                                              tags=[str(num_event)])
+    workflow += node
+
+    # condense the inference output
+    node = plot_exe.create_node()
+    node.add_input_opt("--input-file", inference_file)
+    plot_file = node.new_output_file_opt(workflow.analysis_time, ".png",
+                                              "--output-file",
+                                              tags=[str(num_event)])
+    workflow += node
+
+o = h5py.File('./snrs.hdf', 'w')
+o['snrs'] = nsnrs
+
+# write dax
+workflow.save('gw.dax')
