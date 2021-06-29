@@ -3,7 +3,7 @@
 
  <sub>1. [Albert-Einstein-Institut, Max-Planck-Institut for Gravitationsphysik, D-30167 Hannover, Germany](http://www.aei.mpg.de/obs-rel-cos)</sub>  
  <sub>2. Leibniz Universitat Hannover, D-30167 Hannover, Germany</sub> 
- <sub>3. Universit´e Paris-Saclay, CNRS/IN2P3, IJCLab, 91405 Orsay, France</sub>
+ <sub>3. Université Paris-Saclay, CNRS/IN2P3, IJCLab, 91405 Orsay, France</sub>
 
 This repository is companion data release. [The preprint paper is available from the arxiv](https://arxiv.org/abs/XXXX.XXXXX).
  
